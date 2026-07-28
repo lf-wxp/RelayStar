@@ -1,0 +1,5 @@
+# Host-side crates (relaystar-proto, broker) build with stable.
+# The firmware crates (crates/cardputer-fw, crates/lora-node-fw) pin the Xtensa
+# "esp" toolchain via their own rust-toolchain.toml files.
+[toolchain]
+channel = "stable"

@@ -1,0 +1,21 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
+]
+
+[unstable]
+build-std = ["core", "alloc"]
+
+[env]
+ESP_LOG = "info"
+# --- Set these for your environment before flashing ---
+SSID = "your-wifi-ssid"
+PASSWORD = "your-wifi-password"
+# IPv4 address of the RelayStar MQTT broker (rumqttd), v4 listener on port 1883.
+BROKER_IP = "192.168.1.10"
+BROKER_PORT = "1883"

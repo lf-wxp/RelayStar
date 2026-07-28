@@ -1,0 +1,21 @@
+[package]
+name = "relaystar-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared no_std message protocol and relay logic for RelayStar (LoRa / MQTT / ESP-NOW)."
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+heapless = { workspace = true, features = ["serde"] }
+
+[features]
+default = []
+# Enables std-only conveniences (e.g. std::error::Error impls). Used by the broker.
+std = ["serde/std", "postcard/use-std"]
+
+[dev-dependencies]
+postcard = { version = "1", features = ["use-std"] }

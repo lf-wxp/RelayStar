@@ -1,0 +1,47 @@
+[package]
+name = "lora-node-fw"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "RelayStar simple LoRa node firmware for the LilyGO T3-S3 (ESP32-S3 + SX1262)."
+
+# Standalone workspace: this crate targets Xtensa and is excluded from the root
+# host workspace.
+[workspace]
+
+[dependencies]
+relaystar-proto = { path = "../relaystar-proto", default-features = false }
+
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy"] }
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+embassy-futures = "0.1"
+
+lora-phy = "3.0.1"
+embedded-hal-async = "1.0.0"
+embedded-hal-bus = { version = "0.3.0", features = ["async"] }
+
+ssd1306 = "0.10"
+embedded-graphics = "0.8"
+
+heapless = "0.8"
+static_cell = "2.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+debug = 2
+
+[profile.dev]
+opt-level = "s"

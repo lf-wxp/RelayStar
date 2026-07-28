@@ -1,0 +1,20 @@
+[package]
+name = "relaystar-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "RelayStar MQTT broker (rumqttd), deployable via Docker."
+
+[[bin]]
+name = "relaystar-broker"
+path = "src/main.rs"
+
+[dependencies]
+relaystar-proto = { workspace = true, features = ["std"] }
+rumqttd = "0.20"
+config = { version = "0.14", default-features = false, features = ["toml"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

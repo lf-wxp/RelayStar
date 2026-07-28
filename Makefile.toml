@@ -1,0 +1,182 @@
+# cargo-make build orchestration for the RelayStar workspace.
+#
+# Install once:   cargo install cargo-make
+# Then run e.g.:  cargo make build-all
+#                 cargo make broker
+#                 cargo make flash-card
+#
+# The repo mixes two toolchains: the host crates (relaystar-proto, broker) build
+# with stable Rust from the root workspace, while the firmware crates
+# (crates/cardputer-fw, crates/lora-node-fw) are standalone Xtensa workspaces
+# that pin the `esp` toolchain and `-Z build-std` via their own configs. Firmware
+# tasks therefore run with `cwd` set to the crate directory.
+
+[config]
+# Run each task exactly once at the repo root instead of once per workspace
+# member (which would be wrong for this project).
+default_to_workspace = false
+# Don't load cargo-make's predefined tasks; we define our own explicit graph.
+skip_core_tasks = true
+
+[env]
+RELAYSTAR_BROKER_CONFIG = "docker/rumqttd.toml"
+
+# Default task: a full local verification.
+[tasks.default]
+alias = "check-all"
+
+# ---------------------------------------------------------------------------
+# Aggregate tasks
+# ---------------------------------------------------------------------------
+
+[tasks.check-all]
+description = "Build host crates, run tests, and build both firmware images"
+dependencies = ["host-build", "test", "node-build", "card-build"]
+
+[tasks.build-all]
+description = "Build everything (host crates + both firmware images)"
+dependencies = ["host-build", "fw-build"]
+
+[tasks.fw-build]
+description = "Build both ESP32-S3 firmware images (release)"
+dependencies = ["node-build", "card-build"]
+
+[tasks.clean-all]
+description = "Clean host workspace and both firmware crates"
+dependencies = ["clean-host", "clean-node", "clean-card"]
+
+[tasks.format]
+description = "Format every crate"
+dependencies = ["format-host", "format-node", "format-card"]
+
+[tasks.clippy]
+description = "Run clippy on host + firmware crates"
+dependencies = ["clippy-host", "clippy-node", "clippy-card"]
+
+# ---------------------------------------------------------------------------
+# Host crates (relaystar-proto + relaystar-broker)
+# ---------------------------------------------------------------------------
+
+[tasks.host-build]
+description = "Build host crates (relaystar-proto + broker)"
+command = "cargo"
+args = ["build"]
+
+[tasks.test]
+description = "Run relaystar-proto unit tests"
+command = "cargo"
+args = ["test", "-p", "relaystar-proto"]
+
+[tasks.broker]
+description = "Run the RelayStar MQTT broker (rumqttd)"
+command = "cargo"
+args = ["run", "-p", "relaystar-broker"]
+
+[tasks.clippy-host]
+description = "Clippy for host crates"
+command = "cargo"
+args = ["clippy", "--workspace"]
+
+[tasks.format-host]
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.clean-host]
+command = "cargo"
+args = ["clean"]
+
+# ---------------------------------------------------------------------------
+# Firmware: LoRa node (LilyGO T3-S3)
+# ---------------------------------------------------------------------------
+
+[tasks.node-build]
+description = "Build lora-node-fw (LilyGO T3-S3, release)"
+cwd = "crates/lora-node-fw"
+toolchain = "esp"
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.flash-node]
+description = "Flash + monitor lora-node-fw on a connected board"
+cwd = "crates/lora-node-fw"
+toolchain = "esp"
+command = "cargo"
+args = ["run", "--release"]
+
+[tasks.clippy-node]
+cwd = "crates/lora-node-fw"
+toolchain = "esp"
+command = "cargo"
+args = ["clippy", "--release"]
+
+[tasks.format-node]
+cwd = "crates/lora-node-fw"
+command = "cargo"
+args = ["fmt"]
+
+[tasks.clean-node]
+cwd = "crates/lora-node-fw"
+command = "cargo"
+args = ["clean"]
+
+# ---------------------------------------------------------------------------
+# Firmware: Cardputer terminal (M5Stack Cardputer-Adv)
+# ---------------------------------------------------------------------------
+
+[tasks.card-build]
+description = "Build cardputer-fw (Cardputer-Adv, release)"
+cwd = "crates/cardputer-fw"
+toolchain = "esp"
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.flash-card]
+description = "Flash + monitor cardputer-fw on a connected board"
+cwd = "crates/cardputer-fw"
+toolchain = "esp"
+command = "cargo"
+args = ["run", "--release"]
+
+[tasks.clippy-card]
+cwd = "crates/cardputer-fw"
+toolchain = "esp"
+command = "cargo"
+args = ["clippy", "--release"]
+
+[tasks.format-card]
+cwd = "crates/cardputer-fw"
+command = "cargo"
+args = ["fmt"]
+
+[tasks.clean-card]
+cwd = "crates/cardputer-fw"
+command = "cargo"
+args = ["clean"]
+
+# ---------------------------------------------------------------------------
+# Broker deployment (Docker)
+# ---------------------------------------------------------------------------
+
+[tasks.docker-build]
+description = "Build the broker Docker image"
+command = "docker"
+args = [
+    "build",
+    "-f",
+    "docker/Dockerfile",
+    "-t",
+    "relaystar-broker:latest",
+    ".",
+]
+
+[tasks.docker-up]
+description = "Build and start the broker via docker compose"
+cwd = "docker"
+command = "docker"
+args = ["compose", "up", "--build"]
+
+[tasks.docker-down]
+description = "Stop the broker docker compose stack"
+cwd = "docker"
+command = "docker"
+args = ["compose", "down"]

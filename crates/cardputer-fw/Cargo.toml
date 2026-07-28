@@ -1,0 +1,63 @@
+[package]
+name = "cardputer-fw"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "RelayStar terminal firmware for the M5Stack Cardputer-Adv (ESP32-S3) bridging LoRa, MQTT and ESP-NOW."
+
+# Standalone workspace: this crate targets Xtensa and is excluded from the root
+# host workspace.
+[workspace]
+
+[dependencies]
+relaystar-proto = { path = "../relaystar-proto", default-features = false }
+
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "esp-radio", "embassy"] }
+esp-radio = { version = "0.18.0", features = [
+    "esp32s3",
+    "wifi",
+    "esp-now",
+    "unstable",
+] }
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+embassy-sync = "0.8.0"
+embassy-net = { version = "0.9.1", features = [
+    "dhcpv4",
+    "medium-ethernet",
+    "tcp",
+    "dns",
+    "proto-ipv4",
+] }
+embassy-futures = "0.1"
+
+lora-phy = "3.0.1"
+embedded-hal = "1.0"
+embedded-hal-async = "1.0.0"
+embedded-hal-bus = { version = "0.3.0", features = ["async"] }
+embedded-io-async = "0.7"
+
+mipidsi = "0.9"
+embedded-graphics = "0.8"
+
+heapless = "0.8"
+static_cell = "2.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+debug = 2
+
+[profile.dev]
+opt-level = "s"

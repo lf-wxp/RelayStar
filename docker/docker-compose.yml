@@ -1,0 +1,18 @@
+services:
+  broker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: relaystar-broker:latest
+    container_name: relaystar-broker
+    restart: unless-stopped
+    ports:
+      - "1883:1883" # MQTT v3.1.1
+      - "1884:1884" # MQTT v5
+      - "8080:8080" # MQTT over WebSocket
+      - "3030:3030" # console / metrics
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Override the shipped config without rebuilding the image.
+      - ./rumqttd.toml:/app/rumqttd.toml:ro

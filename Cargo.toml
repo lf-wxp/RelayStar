@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/relaystar-proto", "crates/broker"]
+# Firmware crates target Xtensa (no_std) and are excluded from the default
+# host workspace build. Build them explicitly from their own directories, e.g.
+#   cd crates/cardputer-fw && cargo build --release
+#   cd crates/lora-node-fw && cargo build --release
+# Each firmware crate carries its own .cargo/config.toml pinning the target and
+# the espflash runner. Keeping them out of the virtual workspace avoids Cargo
+# trying to build embedded binaries for the host target.
+exclude = ["crates/cardputer-fw", "crates/lora-node-fw"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["RelayStar contributors"]
+repository = "https://github.com/franciscowu/RelayStar"
+
+[workspace.dependencies]
+relaystar-proto = { path = "crates/relaystar-proto", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }
+postcard = { version = "1", default-features = false }
+heapless = { version = "0.8", default-features = false }

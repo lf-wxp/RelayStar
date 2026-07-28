@@ -1,0 +1,48 @@
+id = 0
+
+# Router: the in-memory commitlog that fans messages out to subscribers.
+[router]
+id = 0
+max_connections = 10010
+max_outgoing_packet_count = 200
+max_segment_size = 104857600
+max_segment_count = 10
+
+# MQTT v3.1.1 listener on the standard port. Cardputer-fw (rust-mqtt) connects
+# here, along with any mosquitto_pub/sub clients and dashboards.
+[v4.1]
+name = "relaystar-v4"
+listen = "0.0.0.0:1883"
+next_connection_delay_ms = 1
+
+[v4.1.connections]
+connection_timeout_ms = 60000
+max_payload_size = 20480
+max_inflight_count = 100
+dynamic_filters = true
+
+# MQTT v5 listener for clients that want v5 features.
+[v5.1]
+name = "relaystar-v5"
+listen = "0.0.0.0:1884"
+next_connection_delay_ms = 1
+
+[v5.1.connections]
+connection_timeout_ms = 60000
+max_payload_size = 20480
+max_inflight_count = 100
+
+# WebSocket listener (handy for browser-based dashboards).
+[ws.1]
+name = "relaystar-ws"
+listen = "0.0.0.0:8080"
+next_connection_delay_ms = 1
+
+[ws.1.connections]
+connection_timeout_ms = 60000
+max_payload_size = 20480
+max_inflight_count = 100
+
+# Prometheus-style console / metrics endpoint.
+[console]
+listen = "0.0.0.0:3030"
