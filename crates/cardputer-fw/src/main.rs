@@ -22,7 +22,7 @@ mod lora;
 mod mqtt;
 
 use embassy_futures::join::{join, join3, join4};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_time::{Delay, Duration, Ticker};
 use esp_backtrace as _;
 use esp_hal::{
@@ -33,8 +33,8 @@ use esp_hal::{
   interrupt::software::SoftwareInterruptControl,
   rng::Rng,
   spi::{
-    master::{Config as SpiConfig, Spi},
     Mode,
+    master::{Config as SpiConfig, Spi},
   },
   time::Rate,
   timer::timg::TimerGroup,
@@ -44,21 +44,21 @@ use esp_println::println;
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_phy::{
-  iv::GenericSx126xInterfaceVariant,
-  sx126x::{self, Sx1262, Sx126x, TcxoCtrlVoltage},
   LoRa,
+  iv::GenericSx126xInterfaceVariant,
+  sx126x::{self, Sx126x, Sx1262, TcxoCtrlVoltage},
 };
 use mipidsi::{
+  Builder,
   interface::SpiInterface,
   models::ST7789,
   options::{ColorInversion, Orientation, Rotation},
-  Builder,
 };
 
-use crate::bridge::{LOCAL_OUT, UI_IN};
+use crate::bridge::UI_IN;
 use crate::display::Ui;
-use crate::keyboard::{decode_key, KeyAction, Keyboard};
-use relaystar_proto::{radio as rparams, Message, Transport, MAX_FRAME};
+use crate::keyboard::{KeyAction, Keyboard, decode_key};
+use relaystar_proto::{MAX_FRAME, radio as rparams};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -295,8 +295,9 @@ where
             }
             Some(KeyAction::Enter) => {
               if !ui.input.is_empty() {
-                // The bridge echoes LOCAL_OUT back to UI_IN for display.
-                send_local(&ui.input);
+                // The bridge echoes locally-composed text back to UI_IN for
+                // display; use the async send_local helper.
+                send_local(&ui.input).await;
                 ui.input.clear();
               }
               dirty = true;
@@ -313,12 +314,7 @@ where
 }
 
 /// Push a locally-composed message onto the bridge for fan-out to all transports.
-fn send_local(text: &str) {
-  match Message::text(bridge::next_id(), Transport::Mqtt, bridge::CARD_ADDR, text) {
-    Ok(msg) => {
-      let _ = LOCAL_OUT.try_send(msg);
-      println!("ui: sent \"{}\"", text);
-    }
-    Err(e) => println!("ui: compose failed {:?}", e),
-  }
+async fn send_local(text: &str) {
+  bridge::send_local_text(text).await;
+  println!("ui: sent \"{}\"", text);
 }

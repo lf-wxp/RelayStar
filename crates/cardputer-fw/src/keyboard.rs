@@ -54,7 +54,7 @@ where
     let _ = i2c.write(TCA8418_ADDR, &[REG_KP_GPIO1, 0xFF]); // rows R0-R7
     let _ = i2c.write(TCA8418_ADDR, &[REG_KP_GPIO2, 0xFF]); // cols C0-C7
     let _ = i2c.write(TCA8418_ADDR, &[REG_KP_GPIO3, 0x03]); // cols C8-C9
-                                                            // Enable key-event interrupt bookkeeping.
+    // Enable key-event interrupt bookkeeping.
     let _ = i2c.write(TCA8418_ADDR, &[REG_CFG, 0x01]);
     // Clear any pending interrupt status.
     let _ = i2c.write(TCA8418_ADDR, &[REG_INT_STAT, 0x0F]);

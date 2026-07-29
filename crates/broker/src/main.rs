@@ -4,9 +4,34 @@
 //! broker. The config path can be overridden with `RELAYSTAR_BROKER_CONFIG`
 //! (defaults to `rumqttd.toml` in the working directory, which is what the
 //! Docker image ships).
+//!
+//! ## Topics
+//!
+//! The broker itself is transport-agnostic and does not decode
+//! [`relaystar_proto::Message`]s. Firmware nodes speak two topic families over
+//! this broker:
+//!
+//! - **Legacy** (used by `cardputer-fw`'s bespoke MQTT client):
+//!   [`LEGACY_UPLINK`] and [`LEGACY_DOWNLINK`].
+//! - **New relay-native** (used by anything built on
+//!   [`relaystar_relay::ports::mqtt::MqttPort`]):
+//!   [`relaystar_relay::ports::mqtt::Topic::BROADCAST`] and per-node
+//!   `relaystar/u/{hex-addr}` topics.
+//!
+//! If you deploy a mesh-aware gateway on the host side, subscribe to
+//! `relaystar/#` and use [`relaystar_relay::Relay`] to decode, dedup, and
+//! reassemble arriving frames.
 
 use anyhow::Context;
+use relaystar_relay::ports::mqtt::Topic as RelayMqttTopic;
 use rumqttd::{Broker, Config};
+
+/// Legacy topic (published to by `cardputer-fw/src/mqtt.rs`) that carries
+/// mesh downlink text.
+const LEGACY_DOWNLINK: &str = "relaystar/downlink";
+/// Legacy topic that a client can publish to in order to inject a text
+/// message into the mesh.
+const LEGACY_UPLINK: &str = "relaystar/uplink";
 
 fn main() -> anyhow::Result<()> {
   tracing_subscriber::fmt()
@@ -35,8 +60,12 @@ fn main() -> anyhow::Result<()> {
   let mut broker = Broker::new(config);
 
   tracing::info!(
-    "RelayStar broker starting; shared protocol wire version carries {} byte max payload",
-    relaystar_proto::MAX_PAYLOAD
+    max_payload_bytes = relaystar_proto::MAX_PAYLOAD,
+    legacy_uplink = %LEGACY_UPLINK,
+    legacy_downlink = %LEGACY_DOWNLINK,
+    relay_broadcast = %RelayMqttTopic::BROADCAST,
+    relay_unicast_prefix = %RelayMqttTopic::UNICAST_PREFIX,
+    "RelayStar broker starting",
   );
 
   // Blocking: returns only when every configured server stops.

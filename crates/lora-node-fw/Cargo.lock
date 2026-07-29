@@ -1221,6 +1221,7 @@ dependencies = [
  "heapless 0.8.0",
  "lora-phy",
  "relaystar-proto",
+ "relaystar-relay",
  "ssd1306",
  "static_cell",
 ]
@@ -1466,6 +1467,18 @@ version = "0.1.0"
 dependencies = [
  "heapless 0.8.0",
  "postcard",
+ "serde",
+]
+
+[[package]]
+name = "relaystar-relay"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal-async",
+ "heapless 0.8.0",
+ "lora-phy",
+ "postcard",
+ "relaystar-proto",
  "serde",
 ]
 

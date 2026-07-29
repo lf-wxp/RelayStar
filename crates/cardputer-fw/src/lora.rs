@@ -2,18 +2,20 @@
 //!
 //! Owns the radio and interleaves continuous RX with servicing the
 //! [`LORA_OUT`](crate::bridge::LORA_OUT) transmit queue. Inbound frames are
-//! decoded, stamped with `origin = Lora`, and pushed to the bridge.
+//! forwarded as raw bytes into
+//! [`INBOUND_RAW`](crate::bridge::INBOUND_RAW); the relay engine (see
+//! [`crate::bridge`]) decodes, deduplicates, and reassembles them.
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use esp_println::println;
 use lora_phy::{
-  mod_params::{Bandwidth, CodingRate, ModulationParams, PacketParams, SpreadingFactor},
   LoRa, RxMode,
+  mod_params::{Bandwidth, CodingRate, ModulationParams, PacketParams, SpreadingFactor},
 };
-use relaystar_proto::{radio as rparams, Message, Transport, MAX_FRAME};
+use relaystar_proto::{MAX_FRAME, Transport, radio as rparams};
 
-use crate::bridge::{INBOUND, LORA_OUT};
+use crate::bridge::{INBOUND_RAW, LORA_OUT, RawFrame};
 
 pub fn map_spreading_factor(sf: u8) -> SpreadingFactor {
   match sf {
@@ -69,21 +71,29 @@ pub async fn lora_loop<RK, DLY>(
     }
 
     match select(lora.rx(&rx_pp, &mut rx_buf), LORA_OUT.receive()).await {
-      // Inbound frame.
+      // Inbound frame: hand raw bytes to the relay engine via the bridge.
       Either::First(res) => match res {
-        Ok((len, status)) => match Message::decode(&rx_buf[..len as usize]) {
-          Ok(mut msg) => {
-            msg.origin = Transport::Lora;
-            println!("lora: RX id={} rssi={}", msg.id, status.rssi);
-            INBOUND.send(msg).await;
+        Ok((len, status)) => {
+          println!("lora: RX {} bytes rssi={}", len, status.rssi);
+          let mut bytes: heapless::Vec<u8, MAX_FRAME> = heapless::Vec::new();
+          if bytes.extend_from_slice(&rx_buf[..len as usize]).is_err() {
+            println!("lora: rx frame exceeds MAX_FRAME, dropped");
+            continue;
           }
-          Err(e) => println!("lora: decode error {:?}", e),
-        },
+          INBOUND_RAW
+            .send(RawFrame {
+              source: Transport::Lora,
+              bytes,
+            })
+            .await;
+        }
         Err(e) => println!("lora: rx error {:?}", e),
       },
 
-      // Outbound message to transmit.
-      Either::Second(msg) => {
+      // Outbound frame from the bridge. `FrameAddr` is informational for
+      // LoRa (link-layer is shared-medium); the destination is already
+      // encoded inside the `Message.to` field.
+      Either::Second((_addr, msg)) => {
         let mut buf = [0u8; MAX_FRAME];
         match msg.encode(&mut buf) {
           Ok(encoded) => {

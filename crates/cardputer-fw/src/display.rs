@@ -4,7 +4,7 @@
 //! and renders them with embedded-graphics onto any `DrawTarget<Color=Rgb565>`.
 
 use embedded_graphics::{
-  mono_font::{ascii::FONT_6X10, MonoTextStyle},
+  mono_font::{MonoTextStyle, ascii::FONT_6X10},
   pixelcolor::Rgb565,
   prelude::*,
   text::{Baseline, Text},

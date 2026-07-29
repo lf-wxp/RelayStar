@@ -24,6 +24,12 @@ pub const MAX_FRAME: usize = 255;
 /// Default hop budget assigned to freshly-created messages.
 pub const DEFAULT_TTL: u8 = 4;
 
+/// Special address value that means "broadcast to every reachable peer".
+///
+/// Used both as [`Message::to`] and as the physical destination in transport
+/// adapters (e.g. ESP-NOW's `FF:FF:FF:FF:FF:FF` MAC).
+pub const BROADCAST_ADDR: [u8; 6] = [0xFF; 6];
+
 /// Radio parameters shared by every LoRa node so they can hear each other.
 ///
 /// The concrete `lora-phy` enum values (spreading factor, bandwidth, coding
@@ -64,10 +70,29 @@ impl Transport {
       Transport::EspNow => "espnow",
     }
   }
+
+  /// Maximum **application payload** (post-fragmentation) that fits into a
+  /// single frame of this transport.
+  ///
+  /// These values are intentionally conservative and account for the postcard
+  /// header + [`Message`] envelope overhead. LoRa is the tightest bound;
+  /// ESP-NOW v1 caps at 250 bytes; MQTT is only bounded by broker limits.
+  pub const fn max_payload(self) -> usize {
+    match self {
+      // LoRa SX126x max ~255 bytes; leave headroom for postcard envelope.
+      Transport::Lora => 180,
+      // ESP-NOW v1 payload cap is 250 bytes; leave headroom.
+      Transport::EspNow => 200,
+      // MQTT is effectively unbounded for our use; keep a sane cap that fits
+      // a Cardputer stack buffer.
+      Transport::Mqtt => 4096,
+    }
+  }
 }
 
 /// Semantic type of a message payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MsgKind {
   /// UTF-8 chat/text payload.
   Text,
@@ -77,6 +102,23 @@ pub enum MsgKind {
   Pong,
   /// Opaque binary telemetry.
   Telemetry,
+}
+
+/// Fragmentation header attached to messages that were split to fit a
+/// transport's MTU.
+///
+/// A `Message` with `frag = None` is a **single, complete** payload. A
+/// `Message` with `frag = Some(_)` is one slice of a larger logical payload
+/// identified by `group_id`; the receiver reassembles by collecting all
+/// `total` slices ordered by `seq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fragment {
+  /// Identifier shared by every slice of the same logical payload.
+  pub group_id: u32,
+  /// Zero-based index of this slice, in `[0, total)`.
+  pub seq: u16,
+  /// Total number of slices that make up the logical payload.
+  pub total: u16,
 }
 
 /// A transport-agnostic RelayStar message.
@@ -90,14 +132,19 @@ pub struct Message {
   pub origin: Transport,
   /// Source node address (MAC for ESP-NOW/Wi-Fi, synthetic id otherwise).
   pub from: [u8; 6],
+  /// Destination address ([`BROADCAST_ADDR`] means broadcast).
+  pub to: [u8; 6],
   /// Payload interpretation hint.
   pub kind: MsgKind,
-  /// Application payload bytes.
+  /// Application payload bytes (for this **fragment**; see [`Fragment`]).
   pub payload: Vec<u8, MAX_PAYLOAD>,
+  /// Fragmentation header (`None` for single-frame messages).
+  pub frag: Option<Fragment>,
 }
 
 /// Errors produced while (de)serializing a [`Message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProtoError {
   /// The payload exceeded [`MAX_PAYLOAD`].
   PayloadTooLarge,
@@ -122,11 +169,32 @@ impl core::fmt::Display for ProtoError {
 impl std::error::Error for ProtoError {}
 
 impl Message {
-  /// Build a new message with [`DEFAULT_TTL`] from a byte payload.
+  /// Build a new **broadcast** message with [`DEFAULT_TTL`] from a byte
+  /// payload.
+  ///
+  /// Prefer [`Message::unicast`] when you already know the recipient.
+  ///
+  /// # Errors
+  /// Returns [`ProtoError::PayloadTooLarge`] if `payload.len() > MAX_PAYLOAD`.
   pub fn new(
     id: u32,
     origin: Transport,
     from: [u8; 6],
+    kind: MsgKind,
+    payload: &[u8],
+  ) -> Result<Self, ProtoError> {
+    Self::unicast(id, origin, from, BROADCAST_ADDR, kind, payload)
+  }
+
+  /// Build a unicast message targeted at `to`.
+  ///
+  /// # Errors
+  /// Returns [`ProtoError::PayloadTooLarge`] if `payload.len() > MAX_PAYLOAD`.
+  pub fn unicast(
+    id: u32,
+    origin: Transport,
+    from: [u8; 6],
+    to: [u8; 6],
     kind: MsgKind,
     payload: &[u8],
   ) -> Result<Self, ProtoError> {
@@ -136,14 +204,29 @@ impl Message {
       ttl: DEFAULT_TTL,
       origin,
       from,
+      to,
       kind,
       payload,
+      frag: None,
     })
   }
 
-  /// Convenience constructor for a UTF-8 text message.
+  /// Convenience constructor for a broadcast UTF-8 text message.
+  ///
+  /// # Errors
+  /// Returns [`ProtoError::PayloadTooLarge`] if the text exceeds [`MAX_PAYLOAD`].
   pub fn text(id: u32, origin: Transport, from: [u8; 6], text: &str) -> Result<Self, ProtoError> {
     Self::new(id, origin, from, MsgKind::Text, text.as_bytes())
+  }
+
+  /// Returns `true` if [`Self::to`] equals [`BROADCAST_ADDR`].
+  pub fn is_broadcast(&self) -> bool {
+    self.to == BROADCAST_ADDR
+  }
+
+  /// Returns `true` if this message is a fragment of a larger payload.
+  pub fn is_fragmented(&self) -> bool {
+    self.frag.is_some()
   }
 
   /// Interpret the payload as UTF-8 text, if valid.
@@ -152,17 +235,28 @@ impl Message {
   }
 
   /// Encode into `buf`, returning the populated slice.
+  ///
+  /// # Errors
+  /// Returns [`ProtoError::BufferTooSmall`] if `buf` cannot hold the encoded
+  /// frame; use [`MAX_FRAME`]-sized buffers to guarantee success.
   pub fn encode<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], ProtoError> {
     postcard::to_slice(self, buf).map_err(|_| ProtoError::BufferTooSmall)
   }
 
   /// Decode a message from its wire bytes.
+  ///
+  /// # Errors
+  /// Returns [`ProtoError::Decode`] if the bytes are not a valid postcard
+  /// encoding of a [`Message`].
   pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
     postcard::from_bytes(bytes).map_err(|_| ProtoError::Decode)
   }
 
   /// Produce the version of this message to forward onto another transport,
   /// decrementing the hop budget. Returns `None` once the TTL is exhausted.
+  ///
+  /// This is a *low-level* helper that only touches TTL. For MTU-aware
+  /// fragmentation and multi-transport fan-out, use `relaystar-relay`.
   pub fn prepared_for_relay(&self) -> Option<Message> {
     if self.ttl == 0 {
       return None;
@@ -240,6 +334,33 @@ mod tests {
     let decoded = Message::decode(encoded).unwrap();
     assert_eq!(decoded, msg);
     assert_eq!(decoded.as_text(), Some("hello relay"));
+    assert!(decoded.is_broadcast());
+    assert!(!decoded.is_fragmented());
+  }
+
+  #[test]
+  fn round_trip_unicast_fragment() {
+    let mut msg = Message::unicast(
+      7,
+      Transport::EspNow,
+      [1; 6],
+      [2; 6],
+      MsgKind::Telemetry,
+      &[0xAA; 32],
+    )
+    .unwrap();
+    msg.frag = Some(Fragment {
+      group_id: 999,
+      seq: 1,
+      total: 3,
+    });
+    let mut buf = [0u8; MAX_FRAME];
+    let encoded = msg.encode(&mut buf).unwrap();
+    let decoded = Message::decode(encoded).unwrap();
+    assert_eq!(decoded, msg);
+    assert!(!decoded.is_broadcast());
+    assert!(decoded.is_fragmented());
+    assert_eq!(decoded.to, [2; 6]);
   }
 
   #[test]
@@ -273,5 +394,12 @@ mod tests {
       Message::new(1, Transport::Lora, [0; 6], MsgKind::Telemetry, &big),
       Err(ProtoError::PayloadTooLarge)
     );
+  }
+
+  #[test]
+  fn transport_max_payload_ordering() {
+    // LoRa is the tightest, MQTT the loosest.
+    assert!(Transport::Lora.max_payload() < Transport::EspNow.max_payload());
+    assert!(Transport::EspNow.max_payload() < Transport::Mqtt.max_payload());
   }
 }

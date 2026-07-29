@@ -1,0 +1,42 @@
+[package]
+name = "relaystar-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Transport-agnostic mesh relay engine for RelayStar: automatic fragmentation, reassembly, deduplication, receiver tracking, and unicast/broadcast fan-out across LoRa, ESP-NOW and MQTT. `no_std` friendly."
+
+[dependencies]
+relaystar-proto = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+heapless = { workspace = true, features = ["serde"] }
+
+# Optional deps – opt in via features. Keeping them out of the default
+# dependency set means downstream crates (e.g. the broker) don't pay any
+# compile cost for transport backends they don't use.
+lora-phy = { version = "3.0.1", optional = true, default-features = false }
+embedded-hal-async = { version = "1.0", optional = true }
+embedded-io-async = { version = "0.7", optional = true }
+
+[features]
+default = []
+# Enables std-only conveniences (e.g. std::error::Error impls) for host use
+# (e.g. from the broker crate).
+std = ["relaystar-proto/std", "serde/std", "postcard/use-std"]
+# Ships a ready-made `SxLoraPort<RK, DLY>` built on `lora-phy` so firmwares
+# don't have to hand-write the `prepare_for_tx → tx → sleep` dance for every
+# node. Pulls in `lora-phy` + `embedded-hal-async` (both `no_std`).
+lora = ["dep:lora-phy", "dep:embedded-hal-async"]
+# Ships a ready-made `Mqtt311Client<S: Read + Write>` (QoS-0, MQTT 3.1.1)
+# built on `embedded-io-async`. Compatible with the `rumqttd` v4.1 listener
+# used by the broker crate on port 1883.
+mqtt = ["dep:embedded-io-async"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dev-dependencies]
+postcard = { version = "1", features = ["use-std"] }

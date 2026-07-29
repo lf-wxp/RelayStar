@@ -4,10 +4,20 @@
 //! RelayStar simple LoRa node for the LilyGO T3-S3 (ESP32-S3 + SX1262).
 //!
 //! Behaviour:
-//! - Listens continuously for RelayStar [`Message`]s over LoRa.
-//! - Every few seconds, transmits a text heartbeat so the Cardputer terminal
-//!   can see the node is alive and relay it onwards.
+//! - Uses [`relaystar_relay::Relay`] to decode inbound LoRa frames (with
+//!   automatic reassembly + deduplication) and to plan outbound frames (with
+//!   automatic MTU-aware fragmentation).
+//! - Every few seconds, transmits a text heartbeat as a **broadcast**.
+//! - When it receives a [`MsgKind::Ping`], it replies with a **unicast**
+//!   `Pong` back to the sender. The receiver table is auto-populated on
+//!   `ingest`, so the unicast target is resolvable without any manual setup.
 //! - Renders the last received text and counters on the onboard SSD1306 OLED.
+//!
+//! The LoRa hardware is driven entirely through
+//! [`relaystar_relay::ports::lora::SxLoraPort`], which owns the `lora-phy`
+//! handle and handles `prepare_for_tx → tx → sleep` (and `prepare_for_rx → rx`)
+//! internally. This firmware only has to deal with board-specific concerns
+//! (SPI / GPIO wiring and the OLED).
 
 use core::fmt::Write as _;
 
@@ -37,12 +47,14 @@ use embedded_graphics::{
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_phy::{
-  LoRa, RxMode,
+  LoRa,
   iv::GenericSx126xInterfaceVariant,
-  mod_params::{Bandwidth, CodingRate, SpreadingFactor},
   sx126x::{self, Sx126x, Sx1262, TcxoCtrlVoltage},
 };
-use relaystar_proto::{MAX_FRAME, Message, MsgKind, Transport, radio as rparams};
+use relaystar_proto::{MAX_FRAME, MsgKind, Transport, radio as rparams};
+use relaystar_relay::port::TransportPort;
+use relaystar_relay::ports::lora::{LoraModulationParams, SxLoraPort};
+use relaystar_relay::{Destination, IngestOutcome, PlannedFrame, Relay, RelayError};
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -52,35 +64,11 @@ const NODE_ADDR: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 /// Message id base so ids from this node don't collide with the Cardputer's.
 const NODE_ID_BASE: u32 = 0x0100_0000;
 
-fn map_spreading_factor(sf: u8) -> SpreadingFactor {
-  match sf {
-    5 => SpreadingFactor::_5,
-    6 => SpreadingFactor::_6,
-    7 => SpreadingFactor::_7,
-    8 => SpreadingFactor::_8,
-    9 => SpreadingFactor::_9,
-    10 => SpreadingFactor::_10,
-    11 => SpreadingFactor::_11,
-    _ => SpreadingFactor::_12,
-  }
-}
-
-fn map_bandwidth(khz: u16) -> Bandwidth {
-  match khz {
-    125 => Bandwidth::_125KHz,
-    250 => Bandwidth::_250KHz,
-    _ => Bandwidth::_500KHz,
-  }
-}
-
-fn map_coding_rate(denom: u8) -> CodingRate {
-  match denom {
-    5 => CodingRate::_4_5,
-    6 => CodingRate::_4_6,
-    7 => CodingRate::_4_7,
-    _ => CodingRate::_4_8,
-  }
-}
+/// Relay engine dimensions for this node:
+/// - `NR = 8` tracked peers (a LoRa node typically sees a handful).
+/// - `NA = 2` concurrent reassembly slots.
+/// - `NF = 32` max fragments per group.
+type NodeRelay = Relay<8, 2, 32>;
 
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) {
@@ -132,7 +120,7 @@ async fn main(_spawner: Spawner) {
     rx_boost: false,
   };
   let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
-  let mut lora = match LoRa::new(Sx126x::new(spi_device, iv, lora_config), false, Delay).await {
+  let lora = match LoRa::new(Sx126x::new(spi_device, iv, lora_config), false, Delay).await {
     Ok(l) => l,
     Err(e) => {
       println!("LoRa init failed: {:?}", e);
@@ -143,29 +131,43 @@ async fn main(_spawner: Spawner) {
     }
   };
 
-  let mdltn = lora
-    .create_modulation_params(
-      map_spreading_factor(rparams::LORA_SPREADING_FACTOR),
-      map_bandwidth(rparams::LORA_BANDWIDTH_KHZ),
-      map_coding_rate(rparams::LORA_CODING_RATE_DENOM),
-      rparams::LORA_FREQUENCY_HZ,
-    )
-    .unwrap();
-  let rx_pp = lora
-    .create_rx_packet_params(
-      rparams::LORA_PREAMBLE_LEN,
-      false,
-      MAX_FRAME as u8,
-      true,
-      false,
-      &mdltn,
-    )
-    .unwrap();
-  let mut tx_pp = lora
-    .create_tx_packet_params(rparams::LORA_PREAMBLE_LEN, false, true, false, &mdltn)
-    .unwrap();
+  // Wrap the raw lora-phy handle in a SxLoraPort so all subsequent TX/RX
+  // goes through relaystar-relay's bundled adapter — no more hand-written
+  // `prepare_for_tx → tx → sleep` sequences here.
+  let mut lora_port = match SxLoraPort::new(
+    lora,
+    LoraModulationParams {
+      frequency_hz: rparams::LORA_FREQUENCY_HZ,
+      spreading_factor: rparams::LORA_SPREADING_FACTOR,
+      bandwidth_khz: rparams::LORA_BANDWIDTH_KHZ,
+      coding_rate_denom: rparams::LORA_CODING_RATE_DENOM,
+      preamble_symbols: rparams::LORA_PREAMBLE_LEN,
+      tx_power_dbm: rparams::LORA_TX_POWER_DBM,
+    },
+    MAX_FRAME as u8,
+  )
+  .await
+  {
+    Ok(p) => p,
+    Err(e) => {
+      println!("SxLoraPort init failed: {}", e);
+      draw_status(&mut display, "LoRa params FAILED", "", 0, 0);
+      loop {
+        Timer::after(Duration::from_secs(5)).await;
+      }
+    }
+  };
 
   println!("LoRa ready @ {} Hz", rparams::LORA_FREQUENCY_HZ);
+
+  // --- Relay engine setup ---
+  //
+  // Only LoRa is registered because this node has a single transport. All
+  // fan-out logic, dedup, reassembly, and receiver learning still apply.
+  let mut relay: NodeRelay = NodeRelay::new(NODE_ADDR, NODE_ID_BASE);
+  if let Err(e) = relay.register_port(Transport::Lora) {
+    println!("relay register_port failed: {}", e);
+  }
 
   let mut rx_buf = [0u8; MAX_FRAME];
   let mut tx_counter: u32 = 0;
@@ -176,27 +178,19 @@ async fn main(_spawner: Spawner) {
   draw_status(&mut display, "LoRa node ready", "", tx_counter, rx_counter);
 
   loop {
-    if let Err(e) = lora
-      .prepare_for_rx(RxMode::Continuous, &mdltn, &rx_pp)
-      .await
-    {
-      println!("prepare_for_rx error: {:?}", e);
-      Timer::after(Duration::from_millis(500)).await;
-      continue;
-    }
-
-    match select(lora.rx(&rx_pp, &mut rx_buf), heartbeat.next()).await {
+    match select(lora_port.rx_frame(&mut rx_buf), heartbeat.next()).await {
       // --- Inbound LoRa frame ---
       Either::First(rx_result) => match rx_result {
-        Ok((len, status)) => {
-          let bytes = &rx_buf[..len as usize];
-          match Message::decode(bytes) {
-            Ok(msg) => {
+        Ok(outcome) => {
+          let len = outcome.len as usize;
+          let bytes = &rx_buf[..len];
+          match relay.ingest(Transport::Lora, bytes) {
+            Ok(IngestOutcome::Complete(msg)) => {
               rx_counter = rx_counter.wrapping_add(1);
               let text = msg.as_text().unwrap_or("<binary>");
               println!(
-                "RX id={} kind={:?} rssi={} \"{}\"",
-                msg.id, msg.kind, status.rssi, text
+                "RX id={} kind={:?} rssi={} snr={} \"{}\"",
+                msg.id, msg.kind, outcome.rssi, outcome.snr, text
               );
               last_rx.clear();
               let _ = write!(last_rx, "{}", text);
@@ -208,89 +202,141 @@ async fn main(_spawner: Spawner) {
                 rx_counter,
               );
 
-              // Reply to pings so the terminal can measure the link.
+              // Reply to pings so the terminal can measure the link. The
+              // relay's auto-learned receiver table lets us reply as a proper
+              // unicast; if for some reason the sender isn't in the table
+              // yet (edge cases with lost fragments) we fall back to a
+              // broadcast.
               if msg.kind == MsgKind::Ping {
-                send_message(
-                  &mut lora,
-                  &mdltn,
-                  &mut tx_pp,
+                let sent = match send_via_port(
+                  &mut lora_port,
+                  &relay,
                   MsgKind::Pong,
                   b"pong",
-                  node_msg_id(tx_counter),
+                  Destination::Unicast(msg.from),
                 )
-                .await;
-                tx_counter = tx_counter.wrapping_add(1);
+                .await
+                {
+                  Ok(n) => n,
+                  Err(RelayError::UnknownReceiver) => send_via_port(
+                    &mut lora_port,
+                    &relay,
+                    MsgKind::Pong,
+                    b"pong",
+                    Destination::Broadcast,
+                  )
+                  .await
+                  .unwrap_or_else(|e| {
+                    println!("plan_send Pong (broadcast fallback) failed: {}", e);
+                    0
+                  }),
+                  Err(e) => {
+                    println!("plan_send Pong failed: {}", e);
+                    0
+                  }
+                };
+                tx_counter = tx_counter.wrapping_add(sent as u32);
               }
             }
-            Err(e) => println!("decode error ({} bytes): {:?}", len, e),
+            Ok(IngestOutcome::NotForMe(_)) => {
+              // Single-transport node: no other transport to forward onto.
+              // Silently drop.
+            }
+            Ok(IngestOutcome::Buffered) => {
+              // Waiting for more fragments; nothing to display yet.
+            }
+            Ok(IngestOutcome::Duplicate) => {
+              // Loop prevention already handled by the relay.
+            }
+            Ok(IngestOutcome::Dropped(reason)) => {
+              println!("relay: reassembly dropped: {:?}", reason);
+            }
+            // `IngestOutcome` is #[non_exhaustive]; ignore future variants.
+            Ok(_) => {}
+            Err(e) => println!("relay: ingest error: {}", e),
           }
         }
-        Err(e) => println!("rx error: {:?}", e),
+        Err(e) => println!("rx error: {}", e),
       },
 
-      // --- Heartbeat: transmit a text message ---
+      // --- Heartbeat: transmit a broadcast text message ---
       Either::Second(_) => {
         let mut text: heapless::String<32> = heapless::String::new();
         let _ = write!(text, "node hb #{}", tx_counter);
-        send_message(
-          &mut lora,
-          &mdltn,
-          &mut tx_pp,
+        match send_via_port(
+          &mut lora_port,
+          &relay,
           MsgKind::Text,
           text.as_bytes(),
-          node_msg_id(tx_counter),
+          Destination::Broadcast,
         )
-        .await;
-        tx_counter = tx_counter.wrapping_add(1);
-        draw_status(&mut display, "TX ->", text.as_str(), tx_counter, rx_counter);
+        .await
+        {
+          Ok(n) => {
+            tx_counter = tx_counter.wrapping_add(n as u32);
+            draw_status(&mut display, "TX ->", text.as_str(), tx_counter, rx_counter);
+          }
+          Err(e) => println!("heartbeat plan_send failed: {}", e),
+        }
       }
     }
   }
 }
 
-fn node_msg_id(counter: u32) -> u32 {
-  NODE_ID_BASE.wrapping_add(counter)
-}
-
-/// Build, encode, and transmit a RelayStar message over LoRa.
-async fn send_message<RK, DLY>(
-  lora: &mut LoRa<RK, DLY>,
-  mdltn: &lora_phy::mod_params::ModulationParams,
-  tx_pp: &mut lora_phy::mod_params::PacketParams,
+/// Plan a send with the relay engine, then emit every resulting LoRa frame
+/// through [`SxLoraPort`]. Returns the number of frames actually transmitted.
+///
+/// This is the *only* place in this firmware that touches the radio TX path,
+/// so callers get the relay's MTU-aware fragmentation for free.
+async fn send_via_port<RK, DLY>(
+  port: &mut SxLoraPort<RK, DLY>,
+  relay: &NodeRelay,
   kind: MsgKind,
   payload: &[u8],
-  id: u32,
-) where
+  dest: Destination,
+) -> Result<usize, RelayError>
+where
   RK: lora_phy::mod_traits::RadioKind,
   DLY: embedded_hal_async::delay::DelayNs,
 {
-  let msg = match Message::new(id, Transport::Lora, NODE_ADDR, kind, payload) {
-    Ok(m) => m,
-    Err(e) => {
-      println!("build message failed: {:?}", e);
-      return;
+  let plan = relay.plan_send(kind, payload, dest)?;
+  let mut sent = 0usize;
+  for frame in plan {
+    if frame.transport != Transport::Lora {
+      continue;
     }
-  };
+    if transmit_planned(port, &frame).await {
+      sent += 1;
+    }
+  }
+  Ok(sent)
+}
+
+/// Encode a [`PlannedFrame`] and hand it to the port. Returns `true` on
+/// successful TX.
+async fn transmit_planned<RK, DLY>(port: &mut SxLoraPort<RK, DLY>, frame: &PlannedFrame) -> bool
+where
+  RK: lora_phy::mod_traits::RadioKind,
+  DLY: embedded_hal_async::delay::DelayNs,
+{
   let mut buf = [0u8; MAX_FRAME];
-  let encoded = match msg.encode(&mut buf) {
+  let encoded = match frame.message.encode(&mut buf) {
     Ok(b) => b,
     Err(e) => {
       println!("encode failed: {:?}", e);
-      return;
+      return false;
     }
   };
-  if let Err(e) = lora
-    .prepare_for_tx(mdltn, tx_pp, rparams::LORA_TX_POWER_DBM, encoded)
-    .await
-  {
-    println!("prepare_for_tx failed: {:?}", e);
-    return;
+  match port.send_frame(frame.addr, encoded).await {
+    Ok(()) => {
+      println!("TX id={} ({} bytes)", frame.message.id, encoded.len());
+      true
+    }
+    Err(e) => {
+      println!("send_frame failed: {}", e);
+      false
+    }
   }
-  match lora.tx().await {
-    Ok(()) => println!("TX id={} ({} bytes)", id, encoded.len()),
-    Err(e) => println!("tx failed: {:?}", e),
-  }
-  let _ = lora.sleep(false).await;
 }
 
 /// Render a two-line status plus counters onto the OLED.

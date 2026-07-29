@@ -107,6 +107,7 @@ dependencies = [
  "lora-phy",
  "mipidsi",
  "relaystar-proto",
+ "relaystar-relay",
  "static_cell",
 ]
 
@@ -1572,6 +1573,17 @@ version = "0.1.0"
 dependencies = [
  "heapless 0.8.0",
  "postcard",
+ "serde",
+]
+
+[[package]]
+name = "relaystar-relay"
+version = "0.1.0"
+dependencies = [
+ "embedded-io-async 0.7.0",
+ "heapless 0.8.0",
+ "postcard",
+ "relaystar-proto",
  "serde",
 ]
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/relaystar-proto", "crates/broker"]
+members = ["crates/relaystar-proto", "crates/relaystar-relay", "crates/broker"]
 # Firmware crates target Xtensa (no_std) and are excluded from the default
 # host workspace build. Build them explicitly from their own directories, e.g.
 #   cd crates/cardputer-fw && cargo build --release
@@ -19,6 +19,7 @@ repository = "https://github.com/franciscowu/RelayStar"
 
 [workspace.dependencies]
 relaystar-proto = { path = "crates/relaystar-proto", default-features = false }
+relaystar-relay = { path = "crates/relaystar-relay", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false }
 heapless = { version = "0.8", default-features = false }

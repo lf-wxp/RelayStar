@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 relaystar-proto = { workspace = true, features = ["std"] }
+relaystar-relay = { workspace = true, features = ["std"] }
 rumqttd = "0.20"
 config = { version = "0.14", default-features = false, features = ["toml"] }
 tracing = "0.1"

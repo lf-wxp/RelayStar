@@ -1,30 +1,65 @@
 //! Central message-routing fabric for the Cardputer terminal.
 //!
-//! Every transport RX path funnels decoded [`Message`]s into [`INBOUND`] (after
-//! stamping the *arrival* transport into `msg.origin`). Locally-composed
-//! messages (from the keyboard) go into [`LOCAL_OUT`]. The [`bridge_loop`]
-//! de-duplicates by message id and fans messages out to the per-transport TX
-//! channels ([`LORA_OUT`], [`MQTT_OUT`], [`ESPNOW_OUT`]) while decrementing TTL,
-//! never echoing a message back onto the transport it arrived on.
+//! Built on top of [`relaystar_relay::Relay`]: fragmentation, reassembly,
+//! deduplication, receiver learning, and unicast/broadcast fan-out are all
+//! handled by the engine. This module just wires it into embassy channels.
+//!
+//! ## Data flow
+//!
+//! ```text
+//!   ┌──── LoRa RX ────┐   ┌──── ESP-NOW RX ────┐   ┌──── MQTT RX ────┐
+//!   │  raw bytes      │   │  raw bytes         │   │  raw bytes      │
+//!   └───────┬─────────┘   └─────────┬──────────┘   └─────────┬───────┘
+//!           │                       │                        │
+//!           ▼                       ▼                        ▼
+//!         RELAY.ingest(source, bytes)   ← locked briefly, sync
+//!           │
+//!           ├─ Complete(msg)  → UI_IN + (if broadcast) relay forward to other transports
+//!           ├─ NotForMe(msg)  → relay forward to every other transport
+//!           ├─ Buffered / Duplicate / Dropped → drop
+//!           │
+//!    forward → RELAY.plan_forward(msg, target) → PlannedFrame
+//!                                                       │
+//!                                                       ▼
+//!                                       LORA_OUT / ESPNOW_OUT / MQTT_OUT
+//!                                                       │
+//!                                                       ▼
+//!                                       transport TX loop encodes + sends
+//! ```
+//!
+//! Locally-composed keyboard input goes through `send_local`, which is a thin
+//! wrapper around [`Relay::plan_send`].
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
-use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
 use esp_println::println;
-use relaystar_proto::{Message, SeenCache, Transport};
+use relaystar_proto::{Message, MsgKind, Transport};
+use relaystar_relay::{Destination, FrameAddr, IngestOutcome, PlannedFrame, Relay, RelayError};
 
 /// This terminal's synthetic 6-byte address (not a real MAC).
 pub const CARD_ADDR: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 /// Message-id base so the Cardputer's ids don't collide with the LoRa node's.
 pub const CARD_ID_BASE: u32 = 0x0200_0000;
 
-static ID_CTR: AtomicU32 = AtomicU32::new(0);
+// Relay dimensions (compile-time, no heap):
+//   NR = 16 tracked peers
+//   NA = 4  concurrent reassembly groups
+//   NF = 32 fragments per group
+type CardRelay = Relay<16, 4, 32>;
 
-/// Allocate a fresh, monotonically-increasing message id for this terminal.
-pub fn next_id() -> u32 {
-  CARD_ID_BASE.wrapping_add(ID_CTR.fetch_add(1, Ordering::Relaxed))
+/// The one relay engine instance. Guarded by an embassy `Mutex` so that any
+/// task can call the *sync* API (`ingest`, `plan_send`, `plan_forward`,
+/// `add_receiver`, ...). We never hold the lock across an `.await`.
+pub static RELAY: Mutex<CriticalSectionRawMutex, CardRelay> =
+  Mutex::new(CardRelay::new(CARD_ADDR, CARD_ID_BASE));
+
+/// Allocate a fresh, monotonically-increasing message id.
+///
+/// Kept for compatibility with the older API; internally delegates to the
+/// relay's own id allocator.
+pub async fn next_id() -> u32 {
+  RELAY.lock().await.next_id()
 }
 
 /// A line to render on the display log.
@@ -38,7 +73,6 @@ impl DisplayLine {
   pub fn from_message(msg: &Message) -> Self {
     let mut text: heapless::String<48> = heapless::String::new();
     let body = msg.as_text().unwrap_or("<binary>");
-    // Truncate to fit.
     for c in body.chars().take(47) {
       let _ = text.push(c);
     }
@@ -49,71 +83,153 @@ impl DisplayLine {
   }
 }
 
-type MsgChannel<const N: usize> = Channel<CriticalSectionRawMutex, Message, N>;
+/// One frame planned for emission on a specific transport.
+///
+/// The three per-transport TX channels carry these instead of raw `Message`s
+/// so that the sending task always knows *how* to address the frame
+/// (broadcast vs. unicast MAC), even for fragmented sends.
+pub type OutFrame = (FrameAddr, Message);
 
-/// Decoded inbound messages from every transport (origin = arrival transport).
-pub static INBOUND: MsgChannel<8> = Channel::new();
-/// Locally-composed messages destined for *all* transports.
-pub static LOCAL_OUT: MsgChannel<4> = Channel::new();
+type OutChannel<const N: usize> = Channel<CriticalSectionRawMutex, OutFrame, N>;
+type RawChannel<const N: usize> = Channel<CriticalSectionRawMutex, RawFrame, N>;
+
+/// A newly-received frame from a transport, still in raw wire form. Fixed
+/// capacity so we don't allocate.
+#[derive(Clone)]
+pub struct RawFrame {
+  pub source: Transport,
+  pub bytes: heapless::Vec<u8, { relaystar_proto::MAX_FRAME }>,
+}
+
+/// Raw inbound frames from every transport (source = arrival transport).
+pub static INBOUND_RAW: RawChannel<8> = Channel::new();
 /// Outbound queue for the LoRa transmitter.
-pub static LORA_OUT: MsgChannel<8> = Channel::new();
+pub static LORA_OUT: OutChannel<8> = Channel::new();
 /// Outbound queue for the MQTT publisher.
-pub static MQTT_OUT: MsgChannel<8> = Channel::new();
+pub static MQTT_OUT: OutChannel<8> = Channel::new();
 /// Outbound queue for the ESP-NOW sender.
-pub static ESPNOW_OUT: MsgChannel<8> = Channel::new();
+pub static ESPNOW_OUT: OutChannel<8> = Channel::new();
 /// Feed of lines to render on the display.
 pub static UI_IN: Channel<CriticalSectionRawMutex, DisplayLine, 8> = Channel::new();
 
-fn enqueue(target: Transport, msg: Message) {
-  let result = match target {
-    Transport::Lora => LORA_OUT.try_send(msg),
-    Transport::Mqtt => MQTT_OUT.try_send(msg),
-    Transport::EspNow => ESPNOW_OUT.try_send(msg),
+fn enqueue(plan: PlannedFrame) {
+  let PlannedFrame {
+    transport,
+    addr,
+    message,
+  } = plan;
+  let result = match transport {
+    Transport::Lora => LORA_OUT.try_send((addr, message)),
+    Transport::Mqtt => MQTT_OUT.try_send((addr, message)),
+    Transport::EspNow => ESPNOW_OUT.try_send((addr, message)),
   };
   if result.is_err() {
     println!(
-      "bridge: {} TX queue full, dropping message",
-      target.as_str()
+      "bridge: {} TX queue full, dropping frame",
+      transport.as_str()
     );
   }
 }
 
-/// The relay engine. Runs forever.
+/// Push a locally-composed broadcast text message. Called from the UI task.
+pub async fn send_local_text(text: &str) {
+  let plan = {
+    let relay = RELAY.lock().await;
+    relay.plan_send(MsgKind::Text, text.as_bytes(), Destination::Broadcast)
+  };
+  let plan = match plan {
+    Ok(p) => p,
+    Err(RelayError::NoPortsRegistered) => {
+      println!("bridge: no ports registered, cannot send");
+      return;
+    }
+    Err(e) => {
+      println!("bridge: plan_send failed: {}", e);
+      return;
+    }
+  };
+
+  // Also surface locally so the user sees their own text.
+  if let Some(first) = plan.first() {
+    let _ = UI_IN.try_send(DisplayLine::from_message(&first.message));
+  }
+  for frame in plan {
+    enqueue(frame);
+  }
+}
+
+/// The relay engine driver. Runs forever, translating raw inbound frames into
+/// display updates plus forward plans.
 pub async fn bridge_loop() {
-  let mut seen: SeenCache<64> = SeenCache::new();
   println!("bridge: relay engine started");
 
+  // Advertise the three transports so `plan_send(Destination::Broadcast)`
+  // fans out over all of them.
+  {
+    let mut relay = RELAY.lock().await;
+    let _ = relay.register_port(Transport::Lora);
+    let _ = relay.register_port(Transport::EspNow);
+    let _ = relay.register_port(Transport::Mqtt);
+  }
+
   loop {
-    match select(INBOUND.receive(), LOCAL_OUT.receive()).await {
-      // Message arrived from a transport (origin already stamped).
-      Either::First(msg) => {
-        if !seen.check_and_insert(msg.id) {
-          // Already seen this id -> loop prevention, drop.
+    let raw = INBOUND_RAW.receive().await;
+
+    // Ingest under the lock; unlock before doing any UI/channel work that
+    // might contend.
+    let outcome = {
+      let mut relay = RELAY.lock().await;
+      match relay.ingest(raw.source, &raw.bytes) {
+        Ok(o) => o,
+        Err(e) => {
+          println!("bridge: ingest error from {}: {}", raw.source.as_str(), e);
           continue;
         }
+      }
+    };
 
-        // Surface it on the display.
+    match outcome {
+      IngestOutcome::Complete(msg) => {
+        // Deliver locally.
         let _ = UI_IN.try_send(DisplayLine::from_message(&msg));
-
-        // Relay to every *other* transport, decrementing TTL.
-        if let Some(relayed) = msg.prepared_for_relay() {
-          for target in Transport::ALL {
-            if target == msg.origin {
-              continue;
-            }
-            enqueue(target, relayed.clone());
-          }
+        // Broadcasts should also be relayed to the *other* transports so a
+        // LoRa broadcast reaches MQTT / ESP-NOW peers.
+        if msg.is_broadcast() {
+          fanout_forward(msg, raw.source).await;
         }
       }
+      IngestOutcome::NotForMe(msg) => {
+        // Pure relay path: forward to every transport except the source.
+        fanout_forward(msg, raw.source).await;
+      }
+      IngestOutcome::Buffered | IngestOutcome::Duplicate => {}
+      IngestOutcome::Dropped(reason) => {
+        println!("bridge: reassembly dropped: {:?}", reason);
+      }
+      // `IngestOutcome` is #[non_exhaustive]; ignore future variants.
+      _ => {}
+    }
+  }
+}
 
-      // Locally-composed message -> send everywhere.
-      Either::Second(msg) => {
-        seen.check_and_insert(msg.id);
-        let _ = UI_IN.try_send(DisplayLine::from_message(&msg));
-        for target in Transport::ALL {
-          enqueue(target, msg.clone());
+/// Forward `msg` to every transport except `skip`. Held-lock windows are
+/// short and never span an `.await`.
+async fn fanout_forward(msg: Message, skip: Transport) {
+  for target in Transport::ALL {
+    if target == skip {
+      continue;
+    }
+    let plan = {
+      let relay = RELAY.lock().await;
+      relay.plan_forward(msg.clone(), target)
+    };
+    match plan {
+      Ok(frames) => {
+        for f in frames {
+          enqueue(f);
         }
       }
+      Err(e) => println!("bridge: plan_forward to {} failed: {}", target.as_str(), e),
     }
   }
 }
