@@ -1,164 +1,40 @@
-//! Minimal MQTT 3.1.1 client (QoS 0) over an embassy-net `TcpSocket`.
+//! MQTT bridge for the Cardputer terminal.
 //!
-//! Rather than depend on a large MQTT crate (whose API churns and whose
-//! `embedded-io-async` version must be matched exactly), RelayStar speaks just
-//! enough of the protocol to CONNECT, SUBSCRIBE, PUBLISH and parse inbound
-//! PUBLISH packets. This is intentionally small and easy to audit.
+//! This module owns the TCP socket to the broker and hands it to the crate-
+//! provided [`Mqtt311Client`] for all protocol work. Local responsibilities
+//! shrink to:
+//!
+//! 1. Reading `BROKER_IP` / `BROKER_PORT` from build-time env.
+//! 2. Reconnect logic (TCP + MQTT CONNECT + SUBSCRIBE).
+//! 3. Bridging between the broker and the mesh:
+//!    - Inbound MQTT PUBLISH → wrap as [`Message`] → push into
+//!      [`INBOUND_RAW`](crate::bridge::INBOUND_RAW).
+//!    - Outbound [`Message`] from [`MQTT_OUT`](crate::bridge::MQTT_OUT) →
+//!      publish as text on [`TOPIC_DOWNLINK`].
 //!
 //! Topic convention (avoids self-echo loops through the broker):
-//! - The terminal SUBSCRIBES to [`TOPIC_UPLINK`] (MQTT world -> mesh).
-//! - The terminal PUBLISHES to [`TOPIC_DOWNLINK`] (mesh -> MQTT world).
+//! - The terminal SUBSCRIBES to [`TOPIC_UPLINK`] (MQTT world → mesh).
+//! - The terminal PUBLISHES to [`TOPIC_DOWNLINK`] (mesh → MQTT world).
 
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{Either3, select3};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, IpEndpoint, Ipv4Address, Stack};
 use embassy_time::{Duration, Ticker, Timer};
-use embedded_io_async::{Read, Write};
 use esp_println::println;
 
-use crate::bridge::{self, MQTT_OUT};
-use relaystar_proto::{Message, Transport};
+use crate::bridge::{self, INBOUND_RAW, MQTT_OUT, RawFrame};
+use relaystar_proto::{MAX_FRAME, Message, Transport};
+use relaystar_relay::ports::mqtt::{Mqtt311Client, PacketId};
 
 /// Injected into the mesh from the MQTT world.
 pub const TOPIC_UPLINK: &str = "relaystar/uplink";
 /// Emitted from the mesh out to the MQTT world.
 pub const TOPIC_DOWNLINK: &str = "relaystar/downlink";
 
+/// MQTT client identifier for this terminal.
 const CLIENT_ID: &str = "relaystar-card";
+/// Keepalive interval sent in CONNECT and honoured by [`Mqtt311Client::ping`].
 const KEEPALIVE_SECS: u16 = 30;
-
-#[derive(Debug)]
-pub enum MqttError {
-  Io,
-  Protocol,
-  Rejected,
-  TooLarge,
-}
-
-fn write_remaining_len<const N: usize>(v: &mut heapless::Vec<u8, N>, mut len: usize) {
-  loop {
-    let mut byte = (len % 128) as u8;
-    len /= 128;
-    if len > 0 {
-      byte |= 0x80;
-    }
-    let _ = v.push(byte);
-    if len == 0 {
-      break;
-    }
-  }
-}
-
-async fn send_frame<S: Write>(
-  socket: &mut S,
-  first_byte: u8,
-  variable: &[u8],
-) -> Result<(), MqttError> {
-  let mut frame: heapless::Vec<u8, 320> = heapless::Vec::new();
-  if frame.push(first_byte).is_err() {
-    return Err(MqttError::TooLarge);
-  }
-  write_remaining_len(&mut frame, variable.len());
-  if frame.extend_from_slice(variable).is_err() {
-    return Err(MqttError::TooLarge);
-  }
-  socket.write_all(&frame).await.map_err(|_| MqttError::Io)
-}
-
-/// Read one full MQTT packet into `buf`, returning `(first_byte, body)`.
-async fn read_packet<'a, S: Read>(
-  socket: &mut S,
-  buf: &'a mut [u8],
-) -> Result<(u8, &'a [u8]), MqttError> {
-  let mut header = [0u8; 1];
-  socket
-    .read_exact(&mut header)
-    .await
-    .map_err(|_| MqttError::Io)?;
-
-  let mut multiplier = 1usize;
-  let mut value = 0usize;
-  loop {
-    let mut b = [0u8; 1];
-    socket.read_exact(&mut b).await.map_err(|_| MqttError::Io)?;
-    value += (b[0] & 0x7f) as usize * multiplier;
-    if b[0] & 0x80 == 0 {
-      break;
-    }
-    multiplier *= 128;
-    if multiplier > 128 * 128 * 128 {
-      return Err(MqttError::Protocol);
-    }
-  }
-
-  if value > buf.len() {
-    return Err(MqttError::TooLarge);
-  }
-  socket
-    .read_exact(&mut buf[..value])
-    .await
-    .map_err(|_| MqttError::Io)?;
-  Ok((header[0], &buf[..value]))
-}
-
-async fn connect<S: Read + Write>(socket: &mut S) -> Result<(), MqttError> {
-  let mut vh: heapless::Vec<u8, 64> = heapless::Vec::new();
-  // Protocol name + level 4 (3.1.1) + clean-session flag.
-  let _ = vh.extend_from_slice(&[0, 4, b'M', b'Q', b'T', b'T', 0x04, 0x02]);
-  let _ = vh.extend_from_slice(&KEEPALIVE_SECS.to_be_bytes());
-  let cid = CLIENT_ID.as_bytes();
-  let _ = vh.extend_from_slice(&(cid.len() as u16).to_be_bytes());
-  let _ = vh.extend_from_slice(cid);
-
-  send_frame(socket, 0x10, &vh).await?;
-
-  let mut buf = [0u8; 8];
-  let (first, body) = read_packet(socket, &mut buf).await?;
-  if first >> 4 != 0x02 || body.len() < 2 {
-    return Err(MqttError::Protocol);
-  }
-  if body[1] != 0x00 {
-    return Err(MqttError::Rejected);
-  }
-  Ok(())
-}
-
-async fn subscribe<S: Read + Write>(
-  socket: &mut S,
-  topic: &str,
-  packet_id: u16,
-) -> Result<(), MqttError> {
-  let mut vh: heapless::Vec<u8, 128> = heapless::Vec::new();
-  let _ = vh.extend_from_slice(&packet_id.to_be_bytes());
-  let _ = vh.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-  let _ = vh.extend_from_slice(topic.as_bytes());
-  let _ = vh.push(0x00); // requested QoS 0
-  send_frame(socket, 0x82, &vh).await?;
-
-  let mut buf = [0u8; 16];
-  let (first, _body) = read_packet(socket, &mut buf).await?;
-  if first >> 4 != 0x09 {
-    return Err(MqttError::Protocol);
-  }
-  Ok(())
-}
-
-async fn publish<S: Write>(socket: &mut S, topic: &str, payload: &[u8]) -> Result<(), MqttError> {
-  let mut vh: heapless::Vec<u8, 300> = heapless::Vec::new();
-  let _ = vh.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-  let _ = vh.extend_from_slice(topic.as_bytes());
-  if vh.extend_from_slice(payload).is_err() {
-    return Err(MqttError::TooLarge);
-  }
-  send_frame(socket, 0x30, &vh).await
-}
-
-async fn ping<S: Write>(socket: &mut S) -> Result<(), MqttError> {
-  socket
-    .write_all(&[0xC0, 0x00])
-    .await
-    .map_err(|_| MqttError::Io)
-}
 
 fn parse_ipv4(s: &str) -> Option<Ipv4Address> {
   let mut parts = [0u8; 4];
@@ -177,33 +53,45 @@ fn parse_ipv4(s: &str) -> Option<Ipv4Address> {
   }
 }
 
-/// Handle an inbound PUBLISH body: extract topic + payload and, if it is on the
-/// uplink topic, inject it into the mesh.
-fn handle_publish(body: &[u8]) {
-  if body.len() < 2 {
-    return;
-  }
-  let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
-  if body.len() < 2 + topic_len {
-    return;
-  }
-  let topic = core::str::from_utf8(&body[2..2 + topic_len]).unwrap_or("");
-  let payload = &body[2 + topic_len..];
-
-  if topic == TOPIC_UPLINK {
-    let text = core::str::from_utf8(payload).unwrap_or("<binary>");
-    match Message::text(bridge::next_id(), Transport::Mqtt, bridge::CARD_ADDR, text) {
-      Ok(msg) => {
-        let _ = bridge::INBOUND.try_send(msg);
-        println!("MQTT uplink -> mesh: \"{}\"", text);
-      }
-      Err(e) => println!("MQTT uplink message build failed: {:?}", e),
+/// Handle a broker-supplied uplink publish: wrap the text in a broadcast
+/// [`Message`], encode it, and push it through the same [`INBOUND_RAW`]
+/// pipeline the other transports use so the relay engine sees uniform
+/// inputs (dedup, learning, forwarding).
+async fn handle_uplink_text(text: &str) {
+  let id = bridge::next_id().await;
+  let msg = match Message::text(id, Transport::Mqtt, bridge::CARD_ADDR, text) {
+    Ok(m) => m,
+    Err(e) => {
+      println!("MQTT uplink message build failed: {:?}", e);
+      return;
     }
+  };
+  let mut buf = [0u8; MAX_FRAME];
+  let encoded = match msg.encode(&mut buf) {
+    Ok(e) => e,
+    Err(e) => {
+      println!("MQTT uplink encode failed: {:?}", e);
+      return;
+    }
+  };
+  let mut bytes: heapless::Vec<u8, MAX_FRAME> = heapless::Vec::new();
+  if bytes.extend_from_slice(encoded).is_err() {
+    println!("MQTT uplink frame exceeds MAX_FRAME");
+    return;
   }
+  INBOUND_RAW
+    .send(RawFrame {
+      source: Transport::Mqtt,
+      bytes,
+    })
+    .await;
+  println!("MQTT uplink -> mesh: \"{}\"", text);
 }
 
-/// Owns the MQTT link: connects, (re)subscribes, and shuttles messages between
-/// the broker and the bridge. Runs forever, reconnecting on failure.
+/// Owns the MQTT link: connects, (re)subscribes, and shuttles messages
+/// between the broker and the bridge. Runs forever, reconnecting on
+/// failure. Protocol details are delegated to
+/// [`Mqtt311Client`](relaystar_relay::ports::mqtt::Mqtt311Client).
 pub async fn mqtt_loop(stack: Stack<'_>) {
   let ip = match parse_ipv4(env!("BROKER_IP")) {
     Some(ip) => ip,
@@ -229,61 +117,99 @@ pub async fn mqtt_loop(stack: Stack<'_>) {
       Timer::after(Duration::from_secs(5)).await;
       continue;
     }
-    if let Err(e) = connect(&mut socket).await {
-      println!("MQTT: CONNECT failed: {:?}", e);
-      Timer::after(Duration::from_secs(5)).await;
-      continue;
-    }
-    if let Err(e) = subscribe(&mut socket, TOPIC_UPLINK, 1).await {
-      println!("MQTT: SUBSCRIBE failed: {:?}", e);
-      Timer::after(Duration::from_secs(5)).await;
-      continue;
-    }
-    println!("MQTT: connected and subscribed to {}", TOPIC_UPLINK);
 
-    let mut pkt_buf = [0u8; 512];
-    let mut ping_ticker = Ticker::every(Duration::from_secs(KEEPALIVE_SECS as u64));
+    // Whether the *session* below aborted before entering the steady-state
+    // event loop. When true we sleep 5s to avoid tight reconnect loops.
+    // (The steady-state event loop, in contrast, breaks out immediately
+    // and reconnects without extra backoff since the socket itself is
+    // likely already stalled.)
+    let mut needs_backoff = false;
 
-    loop {
-      match select3(
-        read_packet(&mut socket, &mut pkt_buf),
-        MQTT_OUT.receive(),
-        ping_ticker.next(),
-      )
-      .await
-      {
-        // Inbound packet from broker.
-        Either3::First(res) => match res {
-          Ok((first, body)) => {
-            let ptype = first >> 4;
-            if ptype == 0x03 {
-              handle_publish(body);
-            }
-            // 0x0D = PINGRESP, others ignored.
-          }
-          Err(e) => {
-            println!("MQTT: read error {:?}, reconnecting", e);
-            break;
-          }
-        },
+    // Scope the borrow of `socket` into the Mqtt311Client. Everything the
+    // MQTT protocol touches lives in this block; when it ends, `mqtt` is
+    // dropped and `socket` becomes free again — no explicit `drop(mqtt)`
+    // needed (which would only trigger `clippy::drop_non_drop` because
+    // the client does not own any Drop resources of its own).
+    {
+      let mut mqtt = Mqtt311Client::new(&mut socket, CLIENT_ID, KEEPALIVE_SECS);
 
-        // Outbound message from the bridge -> publish downlink.
-        Either3::Second(msg) => {
-          let text = msg.as_text().unwrap_or("<binary>");
-          if let Err(e) = publish(&mut socket, TOPIC_DOWNLINK, text.as_bytes()).await {
-            println!("MQTT: publish failed {:?}, reconnecting", e);
-            break;
-          }
+      // Handshake. Any failure aborts the session and requests a backoff
+      // via the flag above; the borrow ends at the block's `}`.
+      'session: {
+        if let Err(e) = mqtt.connect().await {
+          println!("MQTT: CONNECT failed: {}", e);
+          needs_backoff = true;
+          break 'session;
         }
+        if let Err(e) = mqtt.subscribe(TOPIC_UPLINK, PacketId(1)).await {
+          println!("MQTT: SUBSCRIBE failed: {}", e);
+          needs_backoff = true;
+          break 'session;
+        }
+        println!("MQTT: connected and subscribed to {}", TOPIC_UPLINK);
 
-        // Keepalive.
-        Either3::Third(_) => {
-          if ping(&mut socket).await.is_err() {
-            println!("MQTT: ping failed, reconnecting");
-            break;
+        let mut pkt_buf = [0u8; 512];
+        let mut ping_ticker = Ticker::every(Duration::from_secs(KEEPALIVE_SECS as u64));
+
+        // Steady-state event loop: any error breaks out and triggers an
+        // immediate reconnect (no backoff — the failure itself is the
+        // signal that something's already stalled).
+        loop {
+          match select3(
+            mqtt.read_publish(&mut pkt_buf),
+            MQTT_OUT.receive(),
+            ping_ticker.next(),
+          )
+          .await
+          {
+            // Inbound packet from broker.
+            Either3::First(res) => match res {
+              Ok(Some(pubmsg)) => {
+                if pubmsg.topic == TOPIC_UPLINK {
+                  let text = core::str::from_utf8(pubmsg.payload).unwrap_or("<binary>");
+                  handle_uplink_text(text).await;
+                }
+              }
+              Ok(None) => {
+                // Non-PUBLISH packet (e.g. PINGRESP) — ignore.
+              }
+              Err(e) => {
+                println!("MQTT: read error {}, reconnecting", e);
+                break;
+              }
+            },
+
+            // Outbound frame from the bridge → publish downlink.
+            //
+            // Body: publish the raw text if it decodes as UTF-8; otherwise
+            // emit "<binary>". `FrameAddr` is unused because MQTT's topic
+            // scheme is fixed for the legacy uplink/downlink convention.
+            // If you need per-recipient topics, register the relay-native
+            // `MqttPort` (from `relaystar-relay`), which encodes the
+            // address into the topic.
+            Either3::Second((_addr, msg)) => {
+              let text = msg.as_text().unwrap_or("<binary>");
+              if let Err(e) = mqtt.publish(TOPIC_DOWNLINK, text.as_bytes()).await {
+                println!("MQTT: publish failed {}, reconnecting", e);
+                break;
+              }
+            }
+
+            // Keepalive.
+            Either3::Third(_) => {
+              if let Err(e) = mqtt.ping().await {
+                println!("MQTT: ping failed {}, reconnecting", e);
+                break;
+              }
+            }
           }
         }
       }
+      // `mqtt` (and thus its `&mut socket` borrow) is released here.
+    }
+
+    if needs_backoff {
+      Timer::after(Duration::from_secs(5)).await;
     }
   }
 }
